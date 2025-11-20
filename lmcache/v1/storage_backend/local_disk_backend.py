@@ -8,7 +8,6 @@ import threading
 import time
 
 # Third Party
-from lmcache.v1.storage_backend.file_store import FileStore
 import torch
 
 # First Party
@@ -122,8 +121,6 @@ class LocalDiskBackend(StorageBackendInterface):
             os.makedirs(self.path)
             logger.info(f"Created local disk cache directory: {self.path}")
 
-        self.file_store = FileStore(self.path, 1024 * 1024 * 1024 * 4, logger)
-
         self.loop = loop
 
         self.use_local_cpu = config.local_cpu
@@ -230,7 +227,7 @@ class LocalDiskBackend(StorageBackendInterface):
         # )
         # res.result()
 
-        self.file_store.delete(key.to_string())
+        os.remove(path)
 
         if force:
             self.cache_policy.update_on_force_evict(key)
@@ -334,6 +331,7 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
     ) -> None:
+        print("FUNC:batched_submit_put_task")
         for key, memory_obj in zip(keys, memory_objs, strict=False):
             self.submit_put_task(key, memory_obj)
 
@@ -449,15 +447,14 @@ class LocalDiskBackend(StorageBackendInterface):
         kv_chunk = memory_obj.tensor
         assert kv_chunk is not None
         buffer = memory_obj.byte_array
-        # path = self._key_to_path(key)
+        path = self._key_to_path(key)
 
         size = len(buffer)
         self.usage += size
         self.stats_monitor.update_local_storage_usage(self.usage)
 
         # TODO(Jiayi): need to add ref count in disk memory object
-        # self.write_file(buffer, path)
-        self.file_store.put(key.to_string(), buffer)
+        self.write_file(buffer, path)
 
         # ref count down here because there's a ref_count_up in
         # `submit_put_task` above.
@@ -491,8 +488,7 @@ class LocalDiskBackend(StorageBackendInterface):
         # TODO (Jiayi): handle the case where loading fails.
         for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
             buffer = mem_obj.byte_array
-            # self.read_file(key, buffer, path)
-            self.file_store.get(key.to_string(), buffer)
+            self.read_file(key, buffer, path)
 
             # TODO(Jiayi): Please recover the metadata in a more
             # elegant way in the future.
@@ -521,7 +517,7 @@ class LocalDiskBackend(StorageBackendInterface):
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
-        self.file_store.get(key.to_string(), buffer)
+        self.read_file(key, buffer, path)
 
         # TODO(Jiayi): Please recover the metadata in a more
         # elegant way in the future.
@@ -529,6 +525,52 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_obj.metadata.cached_positions = cached_positions
 
         return memory_obj
+
+    def write_file(self, buffer, path):
+        start_time = time.time()
+        size = len(buffer)
+        if size % self.os_disk_bs != 0 or not self.use_odirect:
+            with open(path, "wb") as f:
+                f.write(buffer)
+        else:
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_DIRECT, 0o644)
+            os.write(fd, buffer)
+            os.close(fd)
+        disk_write_time = time.time() - start_time
+        logger.debug(
+            f"Disk write size: {size} bytes, "
+            f"Bandwidth: {size / disk_write_time / 1e6:.2f} MB/s"
+        )
+
+    def read_file(self, key, buffer, path):
+        start_time = time.time()
+        size = len(buffer)
+        fblock_aligned = size % self.os_disk_bs == 0
+        if not fblock_aligned and self.use_odirect:
+            logger.warning(
+                "Cannot use O_DIRECT for this file, "
+                "size is not aligned to disk block size."
+            )
+
+        try:
+            if not fblock_aligned or not self.use_odirect:
+                with open(path, "rb") as f:
+                    f.readinto(buffer)
+            else:
+                fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+                with os.fdopen(fd, "rb", buffering=0) as fdo:
+                    fdo.readinto(buffer)
+        except FileNotFoundError:
+            logger.warning(f"File not found on disk: {path}")
+            if self.dict.get(key, None):
+                self.dict.pop(key)
+            return
+
+        disk_read_time = time.time() - start_time
+        logger.debug(
+            f"Disk read size: {size} bytes, "
+            f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
+        )
 
     def get_allocator_backend(self):
         return self.local_cpu_backend

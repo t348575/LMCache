@@ -123,6 +123,8 @@ _DEPRECATED_CONFIGS = {
 # Single configuration definition center - add new config items only here
 _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     # Basic configurations
+    "num_shards": {"type": int, "default": 8, "env_converter": int},
+    "max_container_size": {"type": int, "default": 1073741824, "env_converter": int},
     "chunk_size": {"type": int, "default": 256, "env_converter": int},
     "local_cpu": {
         "type": bool,

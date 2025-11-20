@@ -1,0 +1,30 @@
+[package]
+name = "rust_disk_backend"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "rust_disk_backend"
+crate-type = ["cdylib"]
+
+[dependencies]
+crossbeam-channel = "0.5.15"
+env_logger = "0.11.8"
+hashbrown = "0.16.0"
+io-uring = "0.7.11"
+libc = "0.2.177"
+log = "0.4.28"
+num_cpus = "1.17.0"
+pyo3 = "0.27.0"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
+[profile.release]
+codegen-units = 1
+opt-level = 3
+lto = true
+strip = true

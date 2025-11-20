@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional
 import asyncio
@@ -25,6 +26,9 @@ if TYPE_CHECKING:
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
+
+from lmcache.v1.storage_backend.rust_disk_backend import RustStorageBackend
+__all__ = ["StorageBackendInterface", "RustStorageBackend"]
 
 
 def is_cuda_worker(metadata: LMCacheEngineMetadata) -> bool:
@@ -175,9 +179,14 @@ def CreateStorageBackends(
 
     if config.local_disk and config.max_local_disk_size > 0:
         assert local_cpu_backend is not None
-        local_disk_backend = LocalDiskBackend(
-            config, loop, local_cpu_backend, dst_device, lmcache_worker
-        )
+        if os.getenv("LMCACHE_ENABLE_LOCAL_DISK") == "1":
+            local_disk_backend = LocalDiskBackend(
+                config, loop, local_cpu_backend, dst_device, lmcache_worker
+            )
+        else:
+            local_disk_backend = RustStorageBackend(
+                config, local_cpu_backend, dst_device, lmcache_worker
+            )
 
         backend_name = str(local_disk_backend)
         storage_backends[backend_name] = local_disk_backend
