@@ -1,16 +1,12 @@
 use std::{
     fs::{File, OpenOptions},
     io,
-    os::{
-        fd::AsRawFd,
-        unix::fs::OpenOptionsExt,
-    },
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::Path,
 };
 
 #[derive(Debug)]
 pub struct Container {
-    pub id: u32,
     pub used: u64,
     pub entries: Vec<(u64, u64)>,
     pub file: File,
@@ -34,24 +30,33 @@ fn posix_fallocate_file(file: &File, len: u64) -> io::Result<()> {
     }
 }
 
+const BLOCK_SIZE: u64 = 4096;
+
+#[inline]
+fn align_up(value: u64, align: u64) -> u64 {
+    debug_assert!(align.is_power_of_two());
+    (value + align - 1) & !(align - 1)
+}
+
 impl Container {
     pub fn new(root_dir: &Path, id: u32, max_size: u64) -> io::Result<Self> {
         let path = root_dir.join(format!("{id}.bin"));
         let file = OpenOptions::new()
             .create(true)
             .read(true)
+            .truncate(true)
             .write(true)
             .custom_flags(0o0040000)
             .open(&path)?;
 
-        posix_fallocate_file(&file, max_size)?;
+        let max_size_aligned = align_up(max_size, BLOCK_SIZE);
+        posix_fallocate_file(&file, max_size_aligned)?;
 
         Ok(Self {
-            id,
             used: 0,
             entries: Vec::new(),
             file,
-            max_size,
+            max_size: max_size_aligned,
         })
     }
 
@@ -89,6 +94,7 @@ impl Container {
     }
 
     pub fn allocate(&mut self, datalen: u64) -> Option<u64> {
+        let datalen = align_up(datalen, BLOCK_SIZE);
         let offset = self.find_free_slot(datalen)?;
         let pos = self
             .entries

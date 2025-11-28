@@ -3,7 +3,6 @@ use std::{io, os::fd::AsRawFd, path::PathBuf, thread::spawn};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use hashbrown::HashMap;
 use io_uring::{IoUring, opcode, types};
-use log::debug;
 
 use crate::container::{Container, Location};
 
@@ -50,30 +49,6 @@ impl ShardState {
         self.create_new_container()
     }
 
-    fn put(&mut self, key: String, data_ptr: usize, size: usize) -> io::Result<()> {
-        let data = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, size) };
-        let datalen = data.len() as u64;
-        let file_id = self.ensure_container_for_write(datalen).expect(&format!(
-            "Shard {} Could not get container for write",
-            self.shard_id
-        ));
-        let (fd, offset) = {
-            let container = self.containers.get_mut(&file_id).unwrap();
-            let offset = container.allocate(datalen).unwrap();
-            let file = container.file.as_raw_fd();
-            (file, offset)
-        };
-
-        self.write_at_io_uring(fd, data, offset)?;
-        let loc = Location {
-            file_id,
-            file_size: datalen,
-            offset,
-        };
-        self.key_index.insert(key, loc);
-        Ok(())
-    }
-
     fn put_batch(&mut self, items: Vec<(u64, String, usize, usize)>) -> Vec<(u64, io::Result<()>)> {
         use std::slice;
 
@@ -88,10 +63,11 @@ impl ShardState {
             let data = unsafe { slice::from_raw_parts(data_ptr as *const u8, size) };
             let datalen = data.len() as u64;
 
-            let file_id = self.ensure_container_for_write(datalen).expect(&format!(
-                "Shard {} Could not get container for write",
-                self.shard_id
-            ));
+            let file_id = self
+                .ensure_container_for_write(datalen)
+                .unwrap_or_else(|_| {
+                    panic!("Shard {} Could not get container for write", self.shard_id)
+                });
 
             let (fd, offset) = {
                 let container = self.containers.get_mut(&file_id).unwrap();
@@ -146,13 +122,13 @@ impl ShardState {
             if res < 0 {
                 results[idx] = Err(io::Error::from_raw_os_error(-res));
             } else if res as usize != pendings[idx].data.len() {
-                results[idx] = Err(io::Error::new(io::ErrorKind::Other, "short write in batch"));
+                results[idx] = Err(io::Error::other("short write in batch"));
             }
         }
 
         pendings
             .into_iter()
-            .zip(results.into_iter())
+            .zip(results)
             .map(|(p, r)| (p.id, r))
             .collect()
     }
@@ -226,7 +202,8 @@ impl ShardState {
                 self.ring
                     .submission()
                     .push(&entry)
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "submission queue is full")).unwrap();
+                    .map_err(|_| io::Error::other("submission queue is full"))
+                    .unwrap();
             }
 
             pendings.push(Pending {
@@ -264,49 +241,19 @@ impl ShardState {
             }
         }
 
-        result_ids.into_iter().zip(results.into_iter()).collect()
+        result_ids.into_iter().zip(results).collect()
     }
 
     fn delete(&mut self, key: String) {
-        if let Some(loc) = self.key_index.remove(&key) {
-            if let Some(container) = self.containers.get_mut(&loc.file_id) {
-                container.free(loc.offset, loc.file_size);
-            }
+        if let Some(loc) = self.key_index.remove(&key)
+            && let Some(container) = self.containers.get_mut(&loc.file_id)
+        {
+            container.free(loc.offset, loc.file_size);
         }
     }
 
     fn contains_key(&self, key: String) -> bool {
         self.key_index.contains_key(&key)
-    }
-
-    fn write_at_io_uring(&mut self, fd: i32, data: &[u8], offset: u64) -> io::Result<()> {
-        let entry = opcode::Write::new(types::Fd(fd), data.as_ptr(), data.len() as u32)
-            .offset(offset)
-            .build()
-            .user_data(0);
-
-        unsafe {
-            self.ring
-                .submission()
-                .push(&entry)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "submission queue is full"))?;
-        }
-
-        self.ring.submit_and_wait(1)?;
-
-        let cqe = self
-            .ring
-            .completion()
-            .next()
-            .expect("completion queue empty");
-        let res = cqe.result();
-        if res < 0 {
-            Err(io::Error::from_raw_os_error(-res))
-        } else if res as usize != data.len() {
-            Err(io::Error::new(io::ErrorKind::Other, "short write"))
-        } else {
-            Ok(())
-        }
     }
 
     fn read_at_io_uring(&mut self, fd: i32, buf: &mut [u8], offset: u64) -> io::Result<()> {
@@ -319,7 +266,7 @@ impl ShardState {
             self.ring
                 .submission()
                 .push(&entry)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "submission queue is full"))?;
+                .map_err(|_| io::Error::other("submission queue is full"))?;
         }
 
         self.ring.submit_and_wait(1)?;
@@ -342,12 +289,6 @@ impl ShardState {
 
 #[derive(Debug)]
 pub enum ShardRequest {
-    Put {
-        id: u64,
-        key: String,
-        data_ptr: usize,
-        size: usize,
-    },
     PutBatch {
         items: Vec<(u64, String, usize, usize)>, // (id, key, data_ptr, size)
     },
@@ -367,7 +308,6 @@ pub enum ShardRequest {
         id: u64,
         key: String,
     },
-    Shutdown,
 }
 
 #[derive(Debug)]
@@ -408,15 +348,6 @@ fn shard_worker_loop(
 ) {
     while let Ok(req) = rx.recv() {
         match req {
-            ShardRequest::Put {
-                id,
-                key,
-                data_ptr,
-                size,
-            } => {
-                let res = state.put(key, data_ptr, size);
-                let _ = tx.send(ShardResponse::Put { id, res });
-            }
             ShardRequest::PutBatch { items } => {
                 let results = state.put_batch(items);
                 for (id, res) in results {
@@ -442,9 +373,6 @@ fn shard_worker_loop(
             ShardRequest::Contains { id, key } => {
                 let res = state.contains_key(key);
                 let _ = tx.send(ShardResponse::Contains { id, res });
-            }
-            ShardRequest::Shutdown => {
-                break;
             }
         }
     }

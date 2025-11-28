@@ -45,7 +45,7 @@ class RustStorageBackend(StorageBackendInterface, StorageBackend):
         if pin:
             self.dict[key].pin()
         self.keys_in_request.append(key)
-        return self.contains_key(key.to_string(), pin)
+        return True
 
     def touch_cache(self):
         with self.disk_lock:
@@ -179,7 +179,7 @@ class RustStorageBackend(StorageBackendInterface, StorageBackend):
         cached_positions = self.dict[key].cached_positions
         memory_obj.metadata.cached_positions = cached_positions
         return memory_obj
-    
+
     async def get_non_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         meta = self.dict[key]
         if meta is None:

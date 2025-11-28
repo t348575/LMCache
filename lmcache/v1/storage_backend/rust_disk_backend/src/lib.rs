@@ -2,10 +2,8 @@ use std::{
     cell::RefCell,
     hash::{Hash, Hasher},
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
+    time::Instant,
 };
 
 use hashbrown::HashMap;
@@ -21,9 +19,8 @@ mod shard;
 pub struct StorageBackend {
     shards: Arc<Vec<crate::shard::ShardHandle>>,
     mask: usize,
+    id: u64,
 }
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[pymethods]
 impl StorageBackend {
@@ -50,7 +47,12 @@ impl StorageBackend {
                     .getattr(py, "max_container_size")
                     .and_then(|v| v.extract(py))
                     .unwrap_or(1024); // 1GB
-                Ok((cache_path, num_shards, max_container_size * 1024 * 1024, chunk_size))
+                Ok((
+                    cache_path,
+                    num_shards,
+                    max_container_size * 1024 * 1024,
+                    chunk_size,
+                ))
             })?;
         debug!("{cache_path}, {num_shards}, {max_container_size}, {chunk_size}");
 
@@ -65,13 +67,14 @@ impl StorageBackend {
         Ok(StorageBackend {
             shards: Arc::new(shards),
             mask: num_shards - 1,
+            id: 0,
         })
     }
 
-    fn contains_key(&self, py: Python<'_>, key: String, _pin: bool) -> bool {
+    fn contains_key(&mut self, py: Python<'_>, key: String, _pin: bool) -> bool {
         py.detach(|| {
             let shard = self.shard_for_key(&key);
-            let id = Self::next_id();
+            let id = self.next_id();
             self.shards[shard]
                 .tx
                 .send(ShardRequest::Contains { id, key })
@@ -95,17 +98,20 @@ impl StorageBackend {
         })
     }
 
-    fn batched_put(&self, py: Python<'_>, keys: Vec<String>, data_ptrs: Vec<(usize, usize)>) {
+    fn batched_put(&mut self, py: Python<'_>, keys: Vec<String>, data_ptrs: Vec<(usize, usize)>) {
         py.detach(|| {
             assert!(keys.len() == data_ptrs.len());
+            let start = Instant::now();
 
             let mut per_shard: HashMap<usize, Vec<(u64, String, usize, usize)>> = HashMap::new();
             let mut pending: Vec<(usize, u64)> = Vec::with_capacity(keys.len());
 
+            let mut total_size = 0;
             for (key, (data_ptr, size)) in keys.into_iter().zip(data_ptrs) {
                 let shard = self.shard_for_key(&key);
-                let id = Self::next_id();
+                let id = self.next_id();
                 pending.push((shard, id));
+                total_size += size;
 
                 per_shard
                     .entry(shard)
@@ -132,13 +138,22 @@ impl StorageBackend {
                     error!("put key failed: {}", err);
                 }
             }
+            let time = start.elapsed().as_secs_f64();
+            let mb = total_size as f64 / 1e6;
+            debug!(
+                "Took {} s for {} MB, Write bandwidth: {:.2} MB/s",
+                time,
+                mb,
+                mb / time,
+            );
         })
     }
 
-    fn get(&self, py: Python<'_>, key: String, data_ptr: usize, data_len: usize) -> bool {
+    fn get(&mut self, py: Python<'_>, key: String, data_ptr: usize, data_len: usize) -> bool {
         py.detach(|| {
+            let start = Instant::now();
             let shard = self.shard_for_key(&key);
-            let id = Self::next_id();
+            let id = self.next_id();
             self.shards[shard]
                 .tx
                 .send(ShardRequest::Get {
@@ -148,29 +163,40 @@ impl StorageBackend {
                     size: data_len,
                 })
                 .unwrap();
-            self.wait_for_response(shard, id, |resp| match resp {
+            let res = self.wait_for_response(shard, id, |resp| match resp {
                 ShardResponse::Get { id: resp_id, res } if resp_id == id => {
                     ExtractResult::Match(res.unwrap_or(false))
                 }
                 other => ExtractResult::NoMatch(other),
-            })
+            });
+            let time = start.elapsed().as_secs_f64();
+            let mb = data_len as f64 / 1e6;
+            debug!(
+                "Took {} s for {} MB, Read bandwidth: {:.2} MB/s",
+                time,
+                mb,
+                mb / time,
+            );
+            res
         })
     }
 
-    fn batched_get(&self, py: Python<'_>, keys: Vec<String>, data_ptrs: Vec<(usize, usize)>) {
+    fn batched_get(&mut self, py: Python<'_>, keys: Vec<String>, data_ptrs: Vec<(usize, usize)>) {
         py.detach(|| {
+            let start = Instant::now();
             assert!(keys.len() == data_ptrs.len());
-
             use hashbrown::HashMap;
 
             let mut per_shard: HashMap<usize, Vec<(u64, String, usize, usize)>> = HashMap::new();
             let mut pending: Vec<(usize, u64)> = Vec::with_capacity(keys.len());
 
+            let mut total_size = 0;
             for (key, (data_ptr, size)) in keys.into_iter().zip(data_ptrs) {
                 let shard = self.shard_for_key(&key);
-                let id = Self::next_id();
+                let id = self.next_id();
                 pending.push((shard, id));
 
+                total_size += size;
                 per_shard
                     .entry(shard)
                     .or_default()
@@ -196,15 +222,24 @@ impl StorageBackend {
                     error!("get key failed: {}", err);
                 }
             }
+
+            let time = start.elapsed().as_secs_f64();
+            let mb = total_size as f64 / 1e6;
+            debug!(
+                "Took {} s for {} MB, Read bandwidth: {:.2} MB/s",
+                time,
+                mb,
+                mb / time,
+            );
         })
     }
 
-    fn batched_contains_key(&self, py: Python<'_>, keys: Vec<String>) -> usize {
+    fn batched_contains_key(&mut self, py: Python<'_>, keys: Vec<String>) -> usize {
         py.detach(|| {
             let mut pending: Vec<(usize, u64)> = Vec::with_capacity(keys.len());
             for key in keys {
                 let shard = self.shard_for_key(&key);
-                let id = Self::next_id();
+                let id = self.next_id();
                 pending.push((shard, id));
 
                 self.shards[shard]
@@ -213,17 +248,23 @@ impl StorageBackend {
                     .unwrap();
             }
 
-            let mut count = 0;
+            let mut items = Vec::new();
             for (shard, id) in pending {
                 let res = self.wait_for_response(shard, id, |resp| match resp {
                     ShardResponse::Contains { id: resp_id, res } if resp_id == id => {
-                        ExtractResult::Match(res)
+                        ExtractResult::Match((id, res))
                     }
                     other => ExtractResult::NoMatch(other),
                 });
-
-                if res {
+                items.push(res);
+            }
+            items.sort_by_key(|x| x.0);
+            let mut count = 0;
+            for (_, exists) in items {
+                if exists {
                     count += 1;
+                } else {
+                    return count;
                 }
             }
             count
@@ -249,8 +290,9 @@ impl StorageBackend {
         (hasher.finish() as usize) & self.mask
     }
 
-    fn next_id() -> u64 {
-        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    fn next_id(&mut self) -> u64 {
+        self.id += 1;
+        self.id
     }
 
     fn wait_for_response<F, T>(&self, shard_idx: usize, id: u64, extract: F) -> T

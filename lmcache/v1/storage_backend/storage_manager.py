@@ -13,6 +13,7 @@ from typing import (
 )
 import asyncio
 import functools
+import time
 import threading
 
 # Third Party
@@ -455,13 +456,27 @@ class StorageManager:
         """
         Blocking function to get the memory objects from the storages.
         """
+        t_start = time.perf_counter()
         # TODO (ApostaC): remove the nested optional here
         for backend_name, storage_backend in self.storage_backends.items():
             if location and backend_name != location:
                 continue
             memory_objs = storage_backend.batched_get_blocking(keys)
             if memory_objs:
+                elapsed = (time.perf_counter() - t_start) * 1000
+                logger.info(
+                    "StorageManager.batched_get backend=%s keys=%d took=%.2f ms",
+                    backend_name,
+                    len(keys),
+                    elapsed,
+                )
                 return memory_objs
+        elapsed = (time.perf_counter() - t_start) * 1000
+        logger.info(
+            "StorageManager.batched_get miss keys=%d took=%.2f ms",
+            len(keys),
+            elapsed,
+        )
         return None
 
     def layerwise_batched_get(
