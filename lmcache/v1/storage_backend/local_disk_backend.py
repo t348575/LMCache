@@ -437,7 +437,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         start = time.perf_counter()
 
-        def load_one_in_sequence(item: list[tuple[CacheEngineKey, MemoryObj]]):
+        def load_one_in_sequence(item: list[tuple[CacheEngineKey, MemoryObj, MemoryObj]]):
             memory_obj = item[0][1]
             dtype = memory_objs[0].get_dtype()
             fmt = memory_objs[0].get_memory_format()
@@ -446,6 +446,7 @@ class LocalDiskBackend(StorageBackendInterface):
             big = self.local_cpu_backend.allocate(new_shape, dtype, fmt)
             file_idx, offset = self.files[item[0][0].to_string()]
             fd, not_identical = self.fd_pool[file_idx]
+            logger.info(f"in_sequence file_idx={file_idx}; offset={offset}; not_identical={not_identical}")
             self.read_file_at_offset(big.byte_array, fd, offset if not_identical else offset * len(memory_obj.byte_array))
             self.split_memory_obj(big, [mo[1] for mo in item])
             big.ref_count_down()
@@ -454,10 +455,13 @@ class LocalDiskBackend(StorageBackendInterface):
             key, obj = item
             file_idx, offset = self.files[key.to_string()]
             fd, not_identical = self.fd_pool[file_idx]
+            logger.info(f"not_sequenced file_idx={file_idx}; offset={offset}; not_identical={not_identical}")
             self.read_file_at_offset(obj.byte_array, fd, offset if not_identical else offset * len(obj.byte_array))
 
+        for item in sequenced:
+            load_one_in_sequence(item)
+
         with ThreadPoolExecutor(max_workers=64) as executor:
-            executor.map(load_one_in_sequence, not_sequenced)
             executor.map(load_one, not_sequenced)
 
         end = time.perf_counter()
@@ -833,6 +837,10 @@ class LocalDiskBackend(StorageBackendInterface):
         ret = os.preadv(fd, [buffer], offset)
         if ret == -1:
             raise RuntimeError("preadv failed")
+        if ret != size:
+            raise RuntimeError(
+                f"preadv returned {ret} bytes, expected {size} bytes at offset {offset}"
+            )
 
         disk_read_time = time.perf_counter() - start_time
         logger.debug(
