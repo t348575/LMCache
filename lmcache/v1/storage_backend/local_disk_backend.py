@@ -108,7 +108,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         self.cache_policy = get_cache_policy(config.cache_policy)
         self.dict = self.cache_policy.init_mutable_mapping()
-        self.files: Dict[str, tuple[int, int]] = {}
+        self.files: Dict[str, tuple[int, int, int]] = {}
         self.fd_pool: Dict[int, tuple[int, int]] = {}
         self.last_file_idx = -1
 
@@ -357,12 +357,14 @@ class LocalDiskBackend(StorageBackendInterface):
             self.disk_worker.insert_put_task(item[0])
             self.cache_policy.update_on_put(item[0])
             item[1].ref_count_up()
-            offset += len(item[1].byte_array)
-            self.usage += len(item[1].byte_array)
+            size = len(item[1].byte_array)
+            offset += size
+            self.usage += size
             self.stats_monitor.update_local_storage_usage(self.usage)
-            self.files[item[0].to_string()] = (self.last_file_idx, offset if not_identical else i)
+            self.files[item[0].to_string()] = (self.last_file_idx, offset if not_identical else i, size)
             i += 1
 
+        logger.debug(f"Writing not_identical={not_identical}; file={self.last_file_idx}")
         if not_identical:
             self.save_batched_bytes_to_disk_one_by_one(zip(keys, memory_objs, strict=False), fd)
         else:
@@ -434,43 +436,59 @@ class LocalDiskBackend(StorageBackendInterface):
 
         sequenced, not_sequenced = self.group_entries_by_sequence(entries)
         logger.info(f"Sequenced: {len(sequenced)}; Not sequenced: {len(not_sequenced)}")
-
-        start = time.perf_counter()
-
-        def load_one_in_sequence(item: list[tuple[CacheEngineKey, MemoryObj, MemoryObj]]):
-            memory_obj = item[0][1]
-            dtype = memory_objs[0].get_dtype()
-            fmt = memory_objs[0].get_memory_format()
-            new_shape = torch.Size((len(item), *memory_objs[0].get_shape()))
-            # logger.info(f"new_shape={new_shape}; dtype={dtype}; fmt={fmt}")
-            big = self.local_cpu_backend.allocate(new_shape, dtype, fmt)
-            file_idx, offset = self.files[item[0][0].to_string()]
-            fd, not_identical = self.fd_pool[file_idx]
-            logger.info(f"in_sequence file_idx={file_idx}; offset={offset}; not_identical={not_identical}")
-            self.read_file_at_offset(big.byte_array, fd, offset if not_identical else offset * len(memory_obj.byte_array))
-            self.split_memory_obj(big, [mo[1] for mo in item])
-            big.ref_count_down()
+        self.disk_lock.release()
 
         def load_one(item: tuple[CacheEngineKey, MemoryObj]):
             key, obj = item
-            file_idx, offset = self.files[key.to_string()]
+            file_idx, offset, _ = self.files[key.to_string()]
             fd, not_identical = self.fd_pool[file_idx]
-            logger.info(f"not_sequenced file_idx={file_idx}; offset={offset}; not_identical={not_identical}")
+            logger.debug(f"not_sequenced file_idx={file_idx}; offset={offset}; not_identical={not_identical}")
             self.read_file_at_offset(obj.byte_array, fd, offset if not_identical else offset * len(obj.byte_array))
 
-        for item in sequenced:
-            load_one_in_sequence(item)
+        def prepare_mem_sequenced(item: list[tuple[CacheEngineKey, MemoryObj]]):
+            memory_obj = item[0][1]
+            dtype = memory_obj.get_dtype()
+            fmt = memory_obj.get_memory_format()
+            new_shape = torch.Size((len(item), *memory_obj.get_shape()))
+            file_idx, offset, _ = self.files[item[0][0].to_string()]
+            fd, not_identical = self.fd_pool[file_idx]
+            logger.debug(f"mem_allocate in_sequence file_idx={file_idx}; entries={len(item)}; offset={offset}; not_identical={not_identical} shape={new_shape}")
+            big = self.local_cpu_backend.allocate(new_shape, dtype, fmt)
+            return big
 
+        def io_sequenced(item: tuple[list[tuple[CacheEngineKey, MemoryObj]], MemoryObj]):
+            entries, big = item
+            file_idx, offset, size = self.files[entries[0][0].to_string()]
+            fd, not_identical = self.fd_pool[file_idx]
+            logger.debug(f"in_sequence file_idx={file_idx}; entries={len(entries)}; offset={offset}; not_identical={not_identical}; shape={big.get_shape()}; size={len(big.byte_array)}")
+            self.read_file_at_offset(big.byte_array, fd, offset if not_identical else offset * size)
+
+        def cleanup_mem_sequenced(item: tuple[list[tuple[CacheEngineKey, MemoryObj]], MemoryObj]):
+            entries, big = item
+            self.split_memory_obj(big, [mo[1] for mo in entries])
+            big.ref_count_down()
+
+        for i in range(len(sequenced)):
+            big = prepare_mem_sequenced(sequenced[i])
+            sequenced[i] = (sequenced[i], big)
+
+        start = time.perf_counter()
         with ThreadPoolExecutor(max_workers=64) as executor:
-            executor.map(load_one, not_sequenced)
-
+            futs = []
+            futs += [executor.submit(io_sequenced, item) for item in sequenced]
+            futs += [executor.submit(load_one, item) for item in not_sequenced]
+            for f in futs:
+                f.result() 
         end = time.perf_counter()
-        total_size = sum(mo.get_physical_size() for mo in memory_objs if mo is not None)
+
+        for i in range(len(sequenced)):
+            cleanup_mem_sequenced(sequenced[i])
+
+        total_size = sum(len(mo.byte_array) for mo in memory_objs if mo is not None)
         runtime = end - start
         mb = total_size / 1e6
         logger.info(f"Took {runtime:.2f} s for {total_size} MB, Read bandwidth: {mb/runtime} MB/s")
 
-        self.disk_lock.release()
         return memory_objs
 
     def group_entries_by_sequence(
@@ -487,7 +505,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 non_sequenced.append((key, mem_obj))
                 continue
 
-            file_idx, offset = self.files[key_str]
+            file_idx, offset, _ = self.files[key_str]
             file_entries.append((file_idx, offset, key, mem_obj))
 
         from collections import defaultdict
@@ -683,6 +701,7 @@ class LocalDiskBackend(StorageBackendInterface):
     def save_batched_bytes_to_disk(self, data: Sequence[tuple[CacheEngineKey, MemoryObj]], fd: int):
         memory_objs = [mo for _, mo in data]
         combined_obj = self.combine_memory_objs(memory_objs)
+        logger.debug(f"Writing shape={combined_obj.get_shape()} len={len(memory_objs)}")
         self.write_file_at_offset(combined_obj.byte_array, fd, 0)
         combined_obj.ref_count_down()
 
