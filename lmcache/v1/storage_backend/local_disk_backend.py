@@ -278,62 +278,6 @@ class LocalDiskBackend(StorageBackendInterface):
                 KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash, str(self))
             )
 
-    def submit_put_task(
-        self,
-        key: CacheEngineKey,
-        memory_obj: MemoryObj,
-    ):
-        assert memory_obj.tensor is not None
-
-        # skip repeated save
-        if self.exists_in_put_tasks(key):
-            logger.debug(f"Put task for {key} is already in progress.")
-            return None
-
-        self.disk_worker.insert_put_task(key)
-
-        # TODO(Jiayi): Fragmentation is not considered here.
-        required_size = memory_obj.get_physical_size()
-        all_evict_keys = []
-        evict_success = True
-        with self.disk_lock:
-            while self.current_cache_size + required_size > self.max_cache_size:
-                evict_keys = self.cache_policy.get_evict_candidates(
-                    self.dict, num_candidates=1
-                )
-                if not evict_keys:
-                    logger.warning(
-                        "No eviction candidates found. Disk space under pressure."
-                    )
-                    evict_success = False
-                    break
-
-                for evict_key in evict_keys:
-                    self.current_cache_size -= self.dict[evict_key].size
-
-                self.batched_remove(evict_keys, force=False)
-
-                all_evict_keys.extend(evict_keys)
-            if evict_success:
-                self.current_cache_size += required_size
-
-        if not evict_success:
-            return None
-
-        self.cache_policy.update_on_put(key)
-        memory_obj.ref_count_up()
-
-        asyncio.run_coroutine_threadsafe(
-            self.disk_worker.submit_task(
-                "put",
-                self.async_save_bytes_to_disk,
-                key=key,
-                memory_obj=memory_obj,
-            ),
-            self.loop,
-        )
-
-    # TODO(Jiayi): enable real batching
     def batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],
@@ -394,44 +338,21 @@ class LocalDiskBackend(StorageBackendInterface):
         end = time.perf_counter()
         runtime = end - start
         mb = total_size / 1e6
-        logger.info(f"Took {runtime:.2f} s for {mb} MB, Write bandwidth: {mb/runtime} MB/s for {len(keys)} keys {"NOT IDENTICAL" if not_identical else "IDENTICAL"}")
+        logger.info(f"Took {runtime:.2f} s for {mb} MB, Write bandwidth: {mb/runtime} MB/s for {len(keys)} keys")
 
-    def get_blocking(
+    async def async_batched_submit_put_task(
         self,
-        key: CacheEngineKey,
-    ) -> Optional[MemoryObj]:
-        """
-        Blocking get function.
-        """
-        logger.debug("get_blocking")
-        self.disk_lock.acquire()
-        if key not in self.dict:
-            self.disk_lock.release()
-            return None
+        keys: Sequence[CacheEngineKey],
+        objs: List[MemoryObj],
+        transfer_spec: Any = None,
+    ) -> None:
+        return self.disk_worker.submit_task("put", self.batched_submit_put_task, keys, objs)
 
-        # Update cache recency
-        self.cache_policy.update_on_hit(key, self.dict)
-
-        disk_meta = self.dict[key]
-        path = disk_meta.path
-        dtype = disk_meta.dtype
-        shape = disk_meta.shape
-        fmt = disk_meta.fmt
-        assert dtype is not None
-        assert shape is not None
-
-        self.disk_lock.release()
-        memory_obj = self.load_bytes_from_disk(
-            key, path, dtype=dtype, shape=shape, fmt=fmt
-        )
-
-        return memory_obj
-
-    def batched_get_blocking(
-        self,
-        keys: List[CacheEngineKey],
-    ) -> List[Optional[MemoryObj]]:
-        logger.debug("batched_get_blocking")
+    def prepare_get(self, keys: List[CacheEngineKey]) -> tuple[
+        List[List[tuple[CacheEngineKey, MemoryObj]]],
+        List[tuple[CacheEngineKey, MemoryObj]],
+        List[Optional[MemoryObj]]
+    ]:
         self.disk_lock.acquire()
         memory_objs = []
         entries = []
@@ -439,26 +360,17 @@ class LocalDiskBackend(StorageBackendInterface):
             if key not in self.dict:
                 memory_objs.append(None)
                 continue
-
-            # Update cache recency
             self.cache_policy.update_on_hit(key, self.dict)
-
             disk_meta = self.dict[key]
+            self.dict[key].pin()
             memory_obj = self.local_cpu_backend.allocate(disk_meta.shape, disk_meta.dtype, disk_meta.fmt)
             assert memory_obj is not None, "Memory allocation failed during disk load."
             memory_objs.append(memory_obj)
             entries.append((key, memory_obj))
 
         sequenced, not_sequenced = self.group_entries_by_sequence(entries)
-        logger.info(f"Sequenced: {len(sequenced)}; Not sequenced: {len(not_sequenced)}")
+        logger.debug(f"Sequenced: {len(sequenced)}; Not sequenced: {len(not_sequenced)}")
         self.disk_lock.release()
-
-        def load_one(item: tuple[CacheEngineKey, MemoryObj]):
-            key, obj = item
-            file_idx, offset, _ = self.files[key.to_string()]
-            fd, not_identical = self.fd_pool[file_idx]
-            logger.debug(f"not_sequenced file_idx={file_idx}; offset={offset}; not_identical={not_identical}")
-            self.read_file_at_offset(obj.byte_array, fd, offset if not_identical else offset * len(obj.byte_array))
 
         def prepare_mem_sequenced(item: list[tuple[CacheEngineKey, MemoryObj]]):
             memory_obj = item[0][1]
@@ -471,33 +383,64 @@ class LocalDiskBackend(StorageBackendInterface):
             big = self.local_cpu_backend.allocate(new_shape, dtype, fmt)
             return big
 
-        def io_sequenced(item: tuple[list[tuple[CacheEngineKey, MemoryObj]], MemoryObj]):
-            entries, big = item
-            file_idx, offset, size = self.files[entries[0][0].to_string()]
-            fd, not_identical = self.fd_pool[file_idx]
-            logger.debug(f"in_sequence file_idx={file_idx}; entries={len(entries)}; offset={offset}; not_identical={not_identical}; shape={big.get_shape()}; size={len(big.byte_array)}")
-            self.read_file_at_offset(big.byte_array, fd, offset if not_identical else offset * size)
-
-        def cleanup_mem_sequenced(item: tuple[list[tuple[CacheEngineKey, MemoryObj]], MemoryObj]):
-            entries, big = item
-            self.split_memory_obj(big, [mo[1] for mo in entries])
-            big.ref_count_down()
-
         for i in range(len(sequenced)):
             big = prepare_mem_sequenced(sequenced[i])
             sequenced[i] = (sequenced[i], big)
+        return sequenced, not_sequenced, memory_objs
+
+    def cleanup_mem_sequenced(self, item: tuple[list[tuple[CacheEngineKey, MemoryObj]], MemoryObj]):
+        entries, big = item
+        self.split_memory_obj(big, [mo[1] for mo in entries])
+        big.ref_count_down()
+
+    def io_sequenced(self, item: tuple[list[tuple[CacheEngineKey, MemoryObj]], MemoryObj]):
+        entries, big = item
+        file_idx, offset, size = self.files[entries[0][0].to_string()]
+        fd, not_identical = self.fd_pool[file_idx]
+        logger.debug(f"in_sequence file_idx={file_idx}; entries={len(entries)}; offset={offset}; not_identical={not_identical}; shape={big.get_shape()}; size={len(big.byte_array)}")
+        self.read_file_at_offset(big.byte_array, fd, offset if not_identical else offset * size)
+
+    def load_one(self, item: tuple[CacheEngineKey, MemoryObj]):
+        key, obj = item
+        file_idx, offset, _ = self.files[key.to_string()]
+        fd, not_identical = self.fd_pool[file_idx]
+        logger.debug(f"not_sequenced file_idx={file_idx}; offset={offset}; not_identical={not_identical}")
+        self.read_file_at_offset(obj.byte_array, fd, offset if not_identical else offset * len(obj.byte_array))
+
+    def cleanup_get(
+        self,
+        sequenced: List[List[tuple[CacheEngineKey, MemoryObj]]],
+        keys: List[CacheEngineKey],
+    ):
+        for i in range(len(sequenced)):
+            self.cleanup_mem_sequenced(sequenced[i])
+
+        with self.disk_lock:
+            for key in keys:
+                self.dict[key].unpin()
+
+    def get_blocking(
+        self,
+        key: CacheEngineKey,
+    ) -> Optional[MemoryObj]:
+        return self.batched_get_blocking([key])[0]
+
+    def batched_get_blocking(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        sequenced, not_sequenced, memory_objs = self.prepare_get(keys)
 
         start = time.perf_counter()
         with ThreadPoolExecutor(max_workers=64) as executor:
             futs = []
-            futs += [executor.submit(io_sequenced, item) for item in sequenced]
-            futs += [executor.submit(load_one, item) for item in not_sequenced]
+            futs += [executor.submit(self.io_sequenced, item) for item in sequenced]
+            futs += [executor.submit(self.load_one, item) for item in not_sequenced]
             for f in futs:
                 f.result() 
         end = time.perf_counter()
 
-        for i in range(len(sequenced)):
-            cleanup_mem_sequenced(sequenced[i])
+        self.cleanup_get(sequenced, keys)
 
         total_size = sum(len(mo.byte_array) for mo in memory_objs if mo is not None)
         runtime = end - start
@@ -519,7 +462,6 @@ class LocalDiskBackend(StorageBackendInterface):
             if key_str not in self.files:
                 non_sequenced.append((key, mem_obj))
                 continue
-
             file_idx, offset, _ = self.files[key_str]
             file_entries.append((file_idx, offset, key, mem_obj))
 
@@ -530,11 +472,8 @@ class LocalDiskBackend(StorageBackendInterface):
 
         for file_idx, file_list in by_file.items():
             file_list.sort(key=lambda x: x[0])
-            # print([f[0] for f in file_list], file_idx)
-
             current_group: List[tuple[CacheEngineKey, MemoryObj]] = []
             last_offset: Optional[int] = None
-
             for offset, key, mem_obj in file_list:
                 if last_offset is None or offset == last_offset + 1:
                     current_group.append((key, mem_obj))
@@ -544,14 +483,11 @@ class LocalDiskBackend(StorageBackendInterface):
                     else:
                         non_sequenced.extend(current_group)
                     current_group = [(key, mem_obj)]
-
                 last_offset = offset
-
             if len(current_group) > 1:
                 sequenced_groups.append(current_group)
             else:
                 non_sequenced.extend(current_group)
-
         return sequenced_groups, non_sequenced
 
     def reassemble(
@@ -583,61 +519,26 @@ class LocalDiskBackend(StorageBackendInterface):
         keys: list[CacheEngineKey],
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
-        mem_objs: list[MemoryObj] = []
-        paths: list[str] = []
-
-        logger.info("Prefetching keys from disk.")
-
-        logger.debug(f"lookup_id: {lookup_id}; Prefetching {len(keys)} keys from disk.")
-        total_size = 0
-        for key in keys:
-            self.disk_lock.acquire()
-            assert key in self.dict, f"Key {key} not found in disk cache after pinning"
-
-            path = self.dict[key].path
-            dtype = self.dict[key].dtype
-            shape = self.dict[key].shape
-            fmt = self.dict[key].fmt
-
-            assert dtype is not None
-            assert shape is not None
-
-            memory_obj = self.local_cpu_backend.allocate(
-                shape,
-                dtype,
-                fmt,
-            )
-            total_size += memory_obj.get_physical_size()
-
-            assert memory_obj is not None, (
-                "Memory allocation failed during async disk load."
-            )
-
-            self.dict[key].pin()
-
-            # NOTE(Jiayi): Currently, we consider prefetch as cache hit.
-            # Update cache recency
-            self.cache_policy.update_on_hit(key, self.dict)
-
-            self.disk_lock.release()
-            logger.debug(f"Prefetching {key} from disk.")
-
-            mem_objs.append(memory_obj)
-            paths.append(path)
+        sequenced, not_sequenced, memory_objs = self.prepare_get(keys)
 
         start = time.perf_counter()
-        res = await self.disk_worker.submit_task(
-            "prefetch",
-            self.batched_async_load_bytes_from_disk,
-            paths=paths,
-            keys=keys,
-            memory_objs=mem_objs,
-        )
+        tasks: list[asyncio.Future] = []
+        for item in sequenced:
+            tasks.append(self.disk_worker.submit_task("prefetch", self.io_sequenced, item))
+        for item in not_sequenced:
+            tasks.append(self.disk_worker.submit_task("prefetch", self.load_one, item))
+
+        await asyncio.gather(*tasks)
         end = time.perf_counter()
+
+        self.cleanup_get(sequenced, keys)
+
+        total_size = sum(len(mo.byte_array) for mo in memory_objs if mo is not None)
         runtime = end - start
         mb = total_size / 1e6
-        logger.info(f"Took {runtime:.2f} s for {total_size} MB, Non blocking Read bandwidth: {mb/runtime} MB/s")
-        return res 
+        logger.info(f"Took {runtime:.2f} s for {total_size} MB, Read bandwidth: {mb/runtime} MB/s")
+
+        return memory_objs
 
     async def batched_async_contains(
         self,
@@ -655,45 +556,6 @@ class LocalDiskBackend(StorageBackendInterface):
                     self.keys_in_request.append(key)
                 num_hit_counts += 1
         return num_hit_counts
-
-    @_lmcache_nvtx_annotate
-    @torch.inference_mode()
-    def async_save_bytes_to_disk(
-        self,
-        key: CacheEngineKey,
-        memory_obj: MemoryObj,
-    ) -> None:
-        """
-        Convert KV to bytes and async store bytes to disk.
-        """
-        kv_chunk = memory_obj.tensor
-        assert kv_chunk is not None
-        buffer = memory_obj.byte_array
-        path = self._key_to_path(key)
-
-        size = len(buffer)
-        self.usage += size
-        self.stats_monitor.update_local_storage_usage(self.usage)
-
-        # TODO(Jiayi): need to add ref count in disk memory object
-        self.write_file(buffer, path)
-
-        # ref count down here because there's a ref_count_up in
-        # `submit_put_task` above.
-        # Ref count down better be before `insert_key` for testing
-        # purposes (e.g., testing mem_leak).
-        # TODO(Jiayi): This could be problematic if the
-        # freed memory object is immediately reused.
-        size = memory_obj.get_physical_size()
-        shape = memory_obj.metadata.shape
-        dtype = memory_obj.metadata.dtype
-        fmt = memory_obj.metadata.fmt
-        cached_positions = memory_obj.metadata.cached_positions
-        memory_obj.ref_count_down()
-
-        self.insert_key(key, size, shape, dtype, fmt, cached_positions=cached_positions)
-
-        self.disk_worker.remove_put_task(key)
 
     def is_batch_not_identical(self, memory_objs: Sequence[MemoryObj]) -> bool:
         ref_shape = memory_objs[0].get_shape()
@@ -782,59 +644,6 @@ class LocalDiskBackend(StorageBackendInterface):
             src_flat = big_tensor_2d[i]
             dst_flat.copy_(src_flat)
 
-    def batched_async_load_bytes_from_disk(
-        self,
-        paths: list[str],
-        keys: list[CacheEngineKey],
-        memory_objs: list[MemoryObj],
-        write_back: bool = False,
-    ) -> list[MemoryObj]:
-        """
-        Async load bytearray from disk.
-        """
-
-        logger.debug("Executing `async_load_bytes` from disk.")
-        # TODO (Jiayi): handle the case where loading fails.
-        for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
-            buffer = mem_obj.byte_array
-            self.read_file(key, buffer, path)
-
-            # TODO(Jiayi): Please recover the metadata in a more
-            # elegant way in the future.
-            cached_positions = self.dict[key].cached_positions
-            mem_obj.metadata.cached_positions = cached_positions
-
-            self.disk_lock.acquire()
-            self.dict[key].unpin()
-            self.disk_lock.release()
-
-        return memory_objs
-
-    def load_bytes_from_disk(
-        self,
-        key: CacheEngineKey,
-        path: str,
-        dtype: torch.dtype,
-        shape: torch.Size,
-        fmt: MemoryFormat,
-    ) -> Optional[MemoryObj]:
-        """
-        Load bytearray from disk.
-        """
-
-        memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
-        assert memory_obj is not None, "Memory allocation failed during disk load."
-
-        buffer = memory_obj.byte_array
-        self.read_file(key, buffer, path)
-
-        # TODO(Jiayi): Please recover the metadata in a more
-        # elegant way in the future.
-        cached_positions = self.dict[key].cached_positions
-        memory_obj.metadata.cached_positions = cached_positions
-
-        return memory_obj
-
     def write_file_at_offset(self, buffer, fd: int, offset: int) -> None:
         start_time = time.time()
         size = len(buffer)
@@ -875,52 +684,6 @@ class LocalDiskBackend(StorageBackendInterface):
             raise RuntimeError(
                 f"preadv returned {ret} bytes, expected {size} bytes at offset {offset}"
             )
-
-        disk_read_time = time.perf_counter() - start_time
-        logger.debug(
-            f"Disk read size: {size} bytes, "
-            f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
-        )
-
-    def write_file(self, buffer, path):
-        start_time = time.time()
-        size = len(buffer)
-        if size % self.os_disk_bs != 0 or not self.use_odirect:
-            with open(path, "wb") as f:
-                f.write(buffer)
-        else:
-            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_DIRECT, 0o644)
-            os.write(fd, buffer)
-            os.close(fd)
-        disk_write_time = time.time() - start_time
-        logger.debug(
-            f"Disk write size: {size} bytes, "
-            f"Bandwidth: {size / disk_write_time / 1e6:.2f} MB/s"
-        )
-
-    def read_file(self, key, buffer, path):
-        start_time = time.perf_counter()
-        size = len(buffer)
-        fblock_aligned = size % self.os_disk_bs == 0
-        if not fblock_aligned and self.use_odirect:
-            logger.warning(
-                "Cannot use O_DIRECT for this file, "
-                "size is not aligned to disk block size."
-            )
-
-        try:
-            if not fblock_aligned or not self.use_odirect:
-                with open(path, "rb") as f:
-                    f.readinto(buffer)
-            else:
-                fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
-                with os.fdopen(fd, "rb", buffering=0) as fdo:
-                    fdo.readinto(buffer)
-        except FileNotFoundError:
-            logger.warning(f"File not found on disk: {path}")
-            if self.dict.get(key, None):
-                self.dict.pop(key)
-            return
 
         disk_read_time = time.perf_counter() - start_time
         logger.debug(
