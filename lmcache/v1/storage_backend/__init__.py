@@ -17,6 +17,7 @@ from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.gds_backend import GdsBackend
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
+from lmcache.v1.storage_backend.hybrid_disk_backend import HybridDiskBackend
 from lmcache.v1.storage_backend.p2p_backend import P2PBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
 from lmcache.v1.storage_backend.weka_gds_backend import WekaGdsBackend
@@ -179,11 +180,15 @@ def CreateStorageBackends(
 
     if config.local_disk and config.max_local_disk_size > 0:
         assert local_cpu_backend is not None
-        if os.getenv("LMCACHE_ENABLE_LOCAL_DISK") == "1":
+        if config.disk_backend == "local":
             local_disk_backend = LocalDiskBackend(
                 config, loop, local_cpu_backend, dst_device, lmcache_worker
             )
-        else:
+        elif config.disk_backend == "hybrid":
+            local_disk_backend = HybridDiskBackend(
+                config, loop, local_cpu_backend, dst_device, lmcache_worker
+            )
+        elif config.disk_backend == "rust":
             local_disk_backend = RustStorageBackend(
                 config, local_cpu_backend, dst_device, lmcache_worker
             )

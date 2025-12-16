@@ -27,6 +27,12 @@ def _parse_local_disk(local_disk) -> Optional[str]:
             local_disk_path = local_disk
     return local_disk_path
 
+def _parse_disk_backend(disk_backend) -> Optional[str]:
+    if disk_backend is None:
+        disk_backend = "local"
+    elif disk_backend not in ["local", "hybrid", "rust"]:
+        raise ValueError(f"Invalid disk backend: {disk_backend}")
+    return disk_backend
 
 def _to_int_list(
     value: Optional[Union[str, int, list[Any]]],
@@ -138,6 +144,8 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": None,
         "env_converter": _parse_local_disk,
     },
+    "chunks_per_file": {"type": Optional[int], "default": None, "env_converter": int},
+    "disk_backend": {"type": _parse_disk_backend, "default": "local"},
     "max_local_disk_size": {"type": float, "default": 0.0, "env_converter": float},
     "remote_url": {
         "type": Optional[str],
