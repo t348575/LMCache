@@ -32,7 +32,7 @@ logger = init_logger(__name__)
 
 
 # TODO(Jiayi): handle cases where cache is repetitvely prefetched.
-class LocalDiskWorker:
+class HybridDiskWorker:
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self.put_lock = threading.Lock()
         self.put_tasks: List[CacheEngineKey] = []
@@ -92,7 +92,7 @@ class LocalDiskWorker:
         self.executor.shutdown(wait=True)
 
 
-class LocalDiskBackend(StorageBackendInterface):
+class HybridDiskBackend(StorageBackendInterface):
     def __init__(
         self,
         config: LMCacheEngineConfig,
@@ -137,7 +137,7 @@ class LocalDiskBackend(StorageBackendInterface):
             self.use_odirect = config.extra_config.get("use_odirect", False)
         logger.info("Using O_DIRECT for disk I/O: %s", self.use_odirect)
 
-        self.disk_worker = LocalDiskWorker(loop)
+        self.disk_worker = HybridDiskWorker(loop)
 
         # TODO(Jiayi): We need a disk space allocator to avoid fragmentation
         # and hide the following details away from the backend.
@@ -155,7 +155,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.usage = 0
 
     def __str__(self):
-        return "LocalDiskBackend"
+        return "HybridDiskBackend"
 
     def _key_to_path(
         self,
@@ -445,7 +445,7 @@ class LocalDiskBackend(StorageBackendInterface):
         total_size = sum(len(mo.byte_array) for mo in memory_objs if mo is not None)
         runtime = end - start
         mb = total_size / 1e6
-        logger.info(f"Took {runtime:.2f} s for {total_size} MB, Read bandwidth: {mb/runtime} MB/s")
+        logger.info(f"Took {runtime:.2f} s for {mb} MB, Read bandwidth: {mb/runtime} MB/s")
 
         return memory_objs
 
