@@ -125,7 +125,7 @@ class LocalDiskBackend(StorageBackendInterface):
             logger.info(f"Created local disk cache directory: {self.path}")
 
         self.loop = loop
-
+        self.chunks_per_file = config.chunks_per_file
         self.use_local_cpu = config.local_cpu
 
         # Block size (for file system I/O)
@@ -340,41 +340,56 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
     ) -> None:
-        start = time.perf_counter()
         total_size = sum(mo.get_physical_size() for mo in memory_objs)
 
-        self.last_file_idx += 1
-        not_identical = self.is_batch_not_identical(memory_objs)
-        if not_identical:
-            fd = os.open(os.path.join(self.path, f"{self.last_file_idx}.bin"), os.O_CREAT | os.O_RDWR, 0o644)
+        if self.chunks_per_file is None:
+            N = len(keys)
         else:
-            fd = os.open(os.path.join(self.path, f"{self.last_file_idx}.bin"), os.O_CREAT | os.O_RDWR | os.O_DIRECT, 0o644)
-        self.fd_pool[self.last_file_idx] = (fd, not_identical)
+            N = self.chunks_per_file
 
-        offset = 0
-        i = 0
-        for item in zip(keys, memory_objs, strict=False):
-            self.disk_worker.insert_put_task(item[0])
-            self.cache_policy.update_on_put(item[0])
-            item[1].ref_count_up()
-            size = len(item[1].byte_array)
-            offset += size
-            self.usage += size
-            self.stats_monitor.update_local_storage_usage(self.usage)
-            self.files[item[0].to_string()] = (self.last_file_idx, offset if not_identical else i, size)
-            i += 1
+        keys: List[List[CacheEngineKey]] = [keys[i:i+N] for i in range(0, len(keys), N)]
+        memory_objs: List[List[MemoryObj]] = [memory_objs[i:i+N] for i in range(0, len(memory_objs), N)]
+        files: List[tuple[int, bool, int]] = []
+        for i in range(len(memory_objs)):
+            self.last_file_idx += 1
+            not_identical = self.is_batch_not_identical(memory_objs[i])
+            if not_identical:
+                fd = os.open(os.path.join(self.path, f"{self.last_file_idx}.bin"), os.O_CREAT | os.O_RDWR, 0o644)
+            else:
+                fd = os.open(os.path.join(self.path, f"{self.last_file_idx}.bin"), os.O_CREAT | os.O_RDWR | os.O_DIRECT, 0o644)
+            files.append((fd, not_identical, self.last_file_idx))
+            self.fd_pool[self.last_file_idx] = (fd, not_identical)
 
-        logger.debug(f"Writing not_identical={not_identical}; file={self.last_file_idx}")
-        if not_identical:
-            self.save_batched_bytes_to_disk_one_by_one(zip(keys, memory_objs, strict=False), fd)
-        else:
-            self.save_batched_bytes_to_disk(zip(keys, memory_objs, strict=False), fd)
+        runtime = 0
+        for k, mo, file in zip(keys, memory_objs, files):
+            fd, not_identical, file_idx = file
+            offset = 0
+            i = 0
+            for item in zip(k, mo, strict=False):
+                self.disk_worker.insert_put_task(item[0])
+                self.cache_policy.update_on_put(item[0])
+                item[1].ref_count_up()
+                size = len(item[1].byte_array)
+                offset += size
+                self.usage += size
+                self.stats_monitor.update_local_storage_usage(self.usage)
+                self.files[item[0].to_string()] = (file_idx, offset if not_identical else i, size)
+                i += 1
 
-        for item in zip(keys, memory_objs, strict=False):
-            item[1].ref_count_down()
-            key, memory_obj = item
-            self.insert_key(key, memory_obj.get_physical_size(), memory_obj.metadata.shape, memory_obj.metadata.dtype, memory_obj.metadata.fmt, cached_positions=memory_obj.metadata.cached_positions)
-            self.disk_worker.remove_put_task(item[0])
+            logger.debug(f"Writing not_identical={not_identical}; file={file_idx}")
+            start = time.perf_counter()
+            if not_identical:
+                self.save_batched_bytes_to_disk_one_by_one(zip(k, mo, strict=False), fd)
+            else:
+                self.save_batched_bytes_to_disk(zip(k, mo, strict=False), fd)
+            end = time.perf_counter()
+            runtime += end - start
+
+            for item in zip(k, mo, strict=False):
+                item[1].ref_count_down()
+                key, memory_obj = item
+                self.insert_key(key, memory_obj.get_physical_size(), memory_obj.metadata.shape, memory_obj.metadata.dtype, memory_obj.metadata.fmt, cached_positions=memory_obj.metadata.cached_positions)
+                self.disk_worker.remove_put_task(item[0])
 
         end = time.perf_counter()
         runtime = end - start
@@ -451,7 +466,7 @@ class LocalDiskBackend(StorageBackendInterface):
             fmt = memory_obj.get_memory_format()
             new_shape = torch.Size((len(item), *memory_obj.get_shape()))
             file_idx, offset, _ = self.files[item[0][0].to_string()]
-            fd, not_identical = self.fd_pool[file_idx]
+            _, not_identical = self.fd_pool[file_idx]
             logger.debug(f"mem_allocate in_sequence file_idx={file_idx}; entries={len(item)}; offset={offset}; not_identical={not_identical} shape={new_shape}")
             big = self.local_cpu_backend.allocate(new_shape, dtype, fmt)
             return big
@@ -692,7 +707,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
     def save_batched_bytes_to_disk_one_by_one(self, data: Sequence[tuple[CacheEngineKey, MemoryObj]], fd: int):
         offset = 0
-        for key, memory_obj in data:
+        for _, memory_obj in data:
             buf = memory_obj.byte_array
             size = len(buf)
             self.write_file_at_offset(buf, fd, offset)
