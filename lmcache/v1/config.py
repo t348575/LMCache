@@ -145,7 +145,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": _parse_local_disk,
     },
     "chunks_per_file": {"type": Optional[int], "default": None, "env_converter": int},
-    "disk_backend": {"type": _parse_disk_backend, "default": "local"},
+    "disk_backend": {"type": _parse_disk_backend, "default": "local", "env_converter": str},
     "max_local_disk_size": {"type": float, "default": 0.0, "env_converter": float},
     "remote_url": {
         "type": Optional[str],
