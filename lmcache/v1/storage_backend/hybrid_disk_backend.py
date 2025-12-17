@@ -33,7 +33,7 @@ logger = init_logger(__name__)
 
 # TODO(Jiayi): handle cases where cache is repetitvely prefetched.
 class HybridDiskWorker:
-    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop, hybrid_num_workers: int) -> None:
         self.put_lock = threading.Lock()
         self.put_tasks: List[CacheEngineKey] = []
 
@@ -41,7 +41,7 @@ class HybridDiskWorker:
         self.prefetch_tasks: dict[CacheEngineKey, Future] = {}
 
         # TODO(Jiayi): make executor and its parameters configurable
-        self.executor = AsyncPQThreadPoolExecutor(loop, max_workers=64)
+        self.executor = AsyncPQThreadPoolExecutor(loop, max_workers=hybrid_num_workers)
         self.loop = loop
         self._closed = False
 
@@ -137,7 +137,8 @@ class HybridDiskBackend(StorageBackendInterface):
             self.use_odirect = config.extra_config.get("use_odirect", False)
         logger.info("Using O_DIRECT for disk I/O: %s", self.use_odirect)
 
-        self.disk_worker = HybridDiskWorker(loop)
+        self.hybrid_num_workers: int = config.hybrid_num_workers
+        self.disk_worker = HybridDiskWorker(loop, self.hybrid_num_workers)
 
         # TODO(Jiayi): We need a disk space allocator to avoid fragmentation
         # and hide the following details away from the backend.
@@ -320,7 +321,7 @@ class HybridDiskBackend(StorageBackendInterface):
                 self.files[item[0].to_string()] = (file_idx, offset if not_identical else i, size)
                 i += 1
 
-            logger.debug(f"Writing not_identical={not_identical}; file={file_idx}")
+            logger.debug(f"Writing not_identical={not_identical}; file={file_idx}; offset={offset}; size={size}; shape={mo[0].get_shape()}")
             start = time.perf_counter()
             if not_identical:
                 self.save_batched_bytes_to_disk_one_by_one(zip(k, mo, strict=False), fd)
@@ -432,7 +433,7 @@ class HybridDiskBackend(StorageBackendInterface):
         sequenced, not_sequenced, memory_objs = self.prepare_get(keys)
 
         start = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=64) as executor:
+        with ThreadPoolExecutor(max_workers=self.hybrid_num_workers) as executor:
             futs = []
             futs += [executor.submit(self.io_sequenced, item) for item in sequenced]
             futs += [executor.submit(self.load_one, item) for item in not_sequenced]
