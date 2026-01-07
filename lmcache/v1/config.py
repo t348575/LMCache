@@ -30,6 +30,95 @@ from lmcache.v1.config_base import (
 logger = init_logger(__name__)
 
 
+def _parse_local_disk(local_disk) -> Optional[str]:
+    match local_disk:
+        case None:
+            local_disk_path = None
+        case path if re.match(r"file://(.*)/", path):
+            local_disk_path = path[7:]
+        case _:
+            local_disk_path = local_disk
+    return local_disk_path
+
+def _parse_disk_backend(disk_backend) -> Optional[str]:
+    if disk_backend is None:
+        disk_backend = "local"
+    elif disk_backend not in ["local", "hybrid", "rust"]:
+        raise ValueError(f"Invalid disk backend: {disk_backend}")
+    return disk_backend
+
+def _to_int_list(
+    value: Optional[Union[str, int, list[Any]]],
+) -> Optional[list[int]]:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [int(x) for x in value]
+    if isinstance(value, int):
+        return [value]
+    parts = [p.strip() for p in str(value).split(",") if p.strip()]
+    return [int(p) for p in parts]
+
+
+def _to_float_list(
+    value: Optional[Union[str, float, list[Any]]],
+) -> Optional[list[float]]:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [float(x) for x in value]
+    if isinstance(value, float):
+        return [value]
+    parts = [p.strip() for p in str(value).split(",") if p.strip()]
+    return [float(p) for p in parts]
+
+
+def _to_str_list(
+    value: Optional[Union[str, list[str]]],
+) -> Optional[list[str]]:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    return [p for p in parts]
+
+
+def _to_bool(
+    value: Optional[Union[bool, int, str]],
+) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ["true", "1"]
+
+
+def _parse_quoted_string(value: str) -> str:
+    """Parse a string that may be surrounded by quotes and handle escape characters.
+
+    Args:
+        value: The input string that may be quoted
+
+    Returns:
+        The unquoted string with escape characters properly handled
+    """
+    if not value:
+        return value
+
+    value = value.strip()
+
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        try:
+            evaluated = ast.literal_eval(value)
+            if isinstance(evaluated, str):
+                return evaluated
+        except (ValueError, SyntaxError):
+            # If ast.literal_eval fails, it's not a valid Python literal.
+            # Fall back to simply stripping the outer quotes.
+            return value[1:-1]
+
+    return value
+
+
 # Configuration aliases and deprecated mappings
 _CONFIG_ALIASES = {
     # Maps deprecated names to current names
@@ -61,6 +150,8 @@ _DEPRECATED_CONFIGS = {
 # Single configuration definition center - add new config items only here
 _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     # Basic configurations
+    "num_shards": {"type": int, "default": 8, "env_converter": int},
+    "max_container_size": {"type": int, "default": 1073741824, "env_converter": int},
     "chunk_size": {"type": int, "default": 256, "env_converter": int},
     "local_cpu": {
         "type": bool,
@@ -74,6 +165,9 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": None,
         "env_converter": _parse_local_disk,
     },
+    "chunks_per_file": {"type": Optional[int], "default": None, "env_converter": int},
+    "disk_backend": {"type": Optional[str], "default": "local", "env_converter": _parse_disk_backend},
+    "hybrid_num_workers": {"type": int, "default": 64, "env_converter": int},
     "max_local_disk_size": {"type": float, "default": 0.0, "env_converter": float},
     "remote_url": {
         "type": Optional[str],

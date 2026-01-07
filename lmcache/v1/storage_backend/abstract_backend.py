@@ -3,6 +3,7 @@
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Union
 import abc
+import time
 import asyncio
 
 # Third Party
@@ -10,6 +11,7 @@ import torch
 
 # First Party
 from lmcache.config import LMCacheEngineMetadata
+from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
@@ -21,6 +23,8 @@ from lmcache.v1.memory_management import (
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.storage_backend import LocalCPUBackend
+    
+logger = init_logger(__name__)
 
 
 class StorageBackendInterface(metaclass=abc.ABCMeta):
@@ -174,8 +178,14 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         :return: a list of memory objects.
         """
         mem_objs = []
+        start = time.perf_counter()
         for key in keys:
             mem_objs.append(self.get_blocking(key))
+        end = time.perf_counter()
+        total_size = sum(mo.get_physical_size() for mo in mem_objs if mo is not None)
+        runtime = end - start
+        mb = total_size / 1e6
+        logger.info(f"Took {runtime:.2f} s for {total_size} MB, Read bandwidth: {mb/runtime} MB/s")
         return mem_objs
 
     @abc.abstractmethod

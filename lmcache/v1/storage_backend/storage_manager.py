@@ -17,6 +17,7 @@ from typing import (
 )
 import asyncio
 import functools
+import time
 import threading
 
 # Third Party
@@ -471,10 +472,18 @@ class StorageManager:
         """
         Blocking function to get the memory objects from the storages.
         """
+        t_start = time.perf_counter()
         # TODO (ApostaC): remove the nested optional here
         for backend_name, storage_backend in self.get_active_storage_backends(location):
             memory_objs = storage_backend.batched_get_blocking(keys)
             if memory_objs:
+                elapsed = (time.perf_counter() - t_start) * 1000
+                logger.info(
+                    "StorageManager.batched_get backend=%s keys=%d took=%.2f ms",
+                    backend_name,
+                    len(keys),
+                    elapsed,
+                )
                 # Align with single-key `get()` logic:
                 # auto-write remote data to local CPU cache
                 if (
@@ -496,6 +505,12 @@ class StorageManager:
                     memory_objs_no_none = cast(List[MemoryObj], memory_objs)
                     local_cpu_backend.batched_submit_put_task(keys, memory_objs_no_none)
                 return memory_objs
+        elapsed = (time.perf_counter() - t_start) * 1000
+        logger.info(
+            "StorageManager.batched_get miss keys=%d took=%.2f ms",
+            len(keys),
+            elapsed,
+        )
         return None
 
     def layerwise_batched_get(

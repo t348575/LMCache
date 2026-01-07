@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
 import os
@@ -350,8 +350,14 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
     ) -> None:
+        start = time.perf_counter()
+        total_size = sum(mo.get_physical_size() for mo in memory_objs)
         for key, memory_obj in zip(keys, memory_objs, strict=False):
             self.submit_put_task(key, memory_obj)
+        end = time.perf_counter()
+        runtime = end - start
+        mb = total_size / 1e6
+        logger.info(f"Took {runtime:.2f} s for {mb} MB, Write bandwidth: {mb/runtime} MB/s")
 
     def get_blocking(
         self,
@@ -383,6 +389,51 @@ class LocalDiskBackend(StorageBackendInterface):
 
         return memory_obj
 
+    def batched_get_blocking(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        self.disk_lock.acquire()
+        memory_objs = []
+        entries = []
+        for key in keys:
+            if key not in self.dict:
+                memory_objs.append(None)
+                continue
+
+            # Update cache recency
+            self.cache_policy.update_on_hit(key, self.dict)
+
+            disk_meta = self.dict[key]
+            path = disk_meta.path
+            dtype = disk_meta.dtype
+            shape = disk_meta.shape
+            fmt = disk_meta.fmt
+            assert dtype is not None
+            assert shape is not None
+            memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
+            assert memory_obj is not None, "Memory allocation failed during disk load."
+            memory_objs.append(memory_obj)
+            entries.append((key, memory_obj, path))
+
+        self.disk_lock.release()
+
+        def load_one(item):
+            key, obj, path = item
+            self.read_file(key, obj.byte_array, path)
+
+        start = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=64) as executor:
+            executor.map(load_one, entries)
+
+        end = time.perf_counter()
+        total_size = sum(mo.get_physical_size() for mo in memory_objs if mo is not None)
+        runtime = end - start
+        mb = total_size / 1e6
+        logger.info(f"Took {runtime:.2f} s for {total_size} MB, Read bandwidth: {mb/runtime} MB/s")
+
+        return memory_objs
+
     async def batched_get_non_blocking(
         self,
         lookup_id: str,
@@ -393,6 +444,7 @@ class LocalDiskBackend(StorageBackendInterface):
         paths: list[str] = []
 
         logger.debug(f"lookup_id: {lookup_id}; Prefetching {len(keys)} keys from disk.")
+        total_size = 0
         for key in keys:
             self.disk_lock.acquire()
             assert key in self.dict, f"Key {key} not found in disk cache after pinning"
@@ -410,6 +462,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 dtype,
                 fmt,
             )
+            total_size += memory_obj.get_physical_size()
 
             assert memory_obj is not None, (
                 "Memory allocation failed during async disk load."
@@ -427,13 +480,19 @@ class LocalDiskBackend(StorageBackendInterface):
             mem_objs.append(memory_obj)
             paths.append(path)
 
-        return await self.disk_worker.submit_task(
+        start = time.perf_counter()
+        res = await self.disk_worker.submit_task(
             "prefetch",
             self.batched_async_load_bytes_from_disk,
             paths=paths,
             keys=keys,
             memory_objs=mem_objs,
         )
+        end = time.perf_counter()
+        runtime = end - start
+        mb = total_size / 1e6
+        logger.info(f"Took {runtime:.2f} s for {total_size} MB, Non blocking Read bandwidth: {mb/runtime} MB/s")
+        return res 
 
     async def batched_async_contains(
         self,
@@ -561,7 +620,7 @@ class LocalDiskBackend(StorageBackendInterface):
         )
 
     def read_file(self, key, buffer, path):
-        start_time = time.time()
+        start_time = time.perf_counter()
         size = len(buffer)
         fblock_aligned = size % self.os_disk_bs == 0
         if not fblock_aligned and self.use_odirect:
@@ -584,7 +643,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.dict.pop(key)
             return
 
-        disk_read_time = time.time() - start_time
+        disk_read_time = time.perf_counter() - start_time
         logger.debug(
             f"Disk read size: {size} bytes, "
             f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
