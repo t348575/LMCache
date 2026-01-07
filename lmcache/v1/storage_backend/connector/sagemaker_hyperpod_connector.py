@@ -6,6 +6,7 @@ from multiprocessing import shared_memory
 from typing import AsyncIterator, List, Optional, Tuple
 import asyncio
 import json
+import time
 import urllib.parse
 
 # Third Party
@@ -14,6 +15,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.protocol import RemoteMetadata
@@ -102,7 +104,8 @@ class SageMakerHyperPodConnector(RemoteConnector):
             streaming PUT requests (default: 64KB)
             **kwargs: Unused legacy parameters (ignored for backward compatibility)
         """
-        super().__init__()
+        # initialize base class, which includes some common attributes
+        super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
 
         # Core configuration
         self.base_url = sagemaker_hyperpod_url.rstrip("/")
@@ -131,9 +134,14 @@ class SageMakerHyperPodConnector(RemoteConnector):
         self.put_inflight = asyncio.Semaphore(self.max_concurrent_requests)
         self.pq_executor = AsyncPQExecutor(loop)
 
-        # Shared memory (lazy initialized)
+        # Shared memory
         self.shared_memory_obj: Optional[shared_memory.SharedMemory] = None
         self.shared_memory_map: Optional[memoryview] = None
+        if self.shared_memory_name:
+            self._init_shared_memory()
+
+        # Observability
+        self._stats_monitor = LMCStatsMonitor.GetOrCreate()
 
         # Statistics for monitoring
         self.stats = {
@@ -151,11 +159,6 @@ class SageMakerHyperPodConnector(RemoteConnector):
             f"bucket={self.bucket_name}, shared_memory={self.shared_memory_name}, "
             f"connections={self.max_connections}, lease_ttl={lease_ttl_s}s"
         )
-
-    def post_init(self):
-        """Initialize shared memory connection after construction."""
-        if self.shared_memory_name:
-            self._init_shared_memory()
 
     def _init_shared_memory(self):
         """Initialize shared memory connection to ai-toolkit daemon."""
@@ -302,25 +305,20 @@ class SageMakerHyperPodConnector(RemoteConnector):
             lease_id: The lease ID to release
 
         Returns:
-            True if release successful or lease already gone, False on error
+            True if release successful, False on error
         """
         key_str = self._key_to_string(key)
-        url = f"{self.base_url}/v1/kv/{self.bucket_name}/{key_str}/leases/{lease_id}"
+        url = f"{self.base_url}/v1/leases/{lease_id}/release"
 
         try:
             result = await self._http_request(
-                "DELETE",
+                "POST",
                 url,
                 timeout=5.0,
                 gate=self.control_inflight,
             )
 
-            # Accept 200/204 (success) and 404 (already expired/released)
-            if result and result["status"] in (
-                HTTP_OK,
-                HTTP_NO_CONTENT,
-                HTTP_NOT_FOUND,
-            ):
+            if result and result["status"] == HTTP_OK:
                 self.stats["lease_released"] += 1
                 logger.debug(f"Lease released: key={key_str}, lease_id={lease_id}")
                 return True
@@ -477,12 +475,12 @@ class SageMakerHyperPodConnector(RemoteConnector):
                 return None
 
             # Restore original shape (remove padding zeros)
-            actual_shape = self._parse_shape(metadata.shape)
+            actual_shape = self._parse_shape(metadata.shapes[0])
 
             # Allocate local CPU memory
             memory_obj = self.local_cpu_backend.allocate(
                 actual_shape,
-                metadata.dtype,
+                metadata.dtypes[0],
                 metadata.fmt,
             )
             if memory_obj is None:
@@ -505,9 +503,11 @@ class SageMakerHyperPodConnector(RemoteConnector):
                 return None
 
             logger.debug(
-                f"Read from shared memory: key={key.to_string()}, "
-                f"shape={actual_shape}, dtype={metadata.dtype},"
-                f"size={metadata.length} bytes"
+                "Read from shared memory: key=%s, shape=%s, dtype=%s, size=%s bytes",
+                key.to_string(),
+                actual_shape,
+                metadata.dtypes[0],
+                metadata.length,
             )
 
             return memory_obj
@@ -662,12 +662,13 @@ class SageMakerHyperPodConnector(RemoteConnector):
 
     async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """
-        Retrieve KV cache data for the given key.
+        Retrieve KV cache data for the given key with metrics reporting.
 
         Flow:
         1. Acquire a new lease
         2. Read from shared memory using lease offsets
         3. Release lease immediately (in finally block)
+        4. Report metrics
 
         Args:
             key: The cache key to retrieve
@@ -675,6 +676,8 @@ class SageMakerHyperPodConnector(RemoteConnector):
         Returns:
             MemoryObj containing the KV cache data, or None if not found
         """
+        begin = time.perf_counter()
+
         lease_info = await self._executor_submit_lease_acquisition(key)
 
         if lease_info is None:
@@ -686,10 +689,20 @@ class SageMakerHyperPodConnector(RemoteConnector):
             memory_obj = self._read_from_shared_memory(key, lease_info)
 
             if memory_obj is not None:
+                end = time.perf_counter()
+                obj_size = memory_obj.get_size()
+
+                # Report metrics for successful get
+                self._stats_monitor.update_interval_remote_time_to_get(
+                    (end - begin) * 1000
+                )
+                self._stats_monitor.update_interval_remote_read_metrics(obj_size)
+
                 self.stats["get_success"] += 1
                 logger.debug(
                     f"GET success: key={key.to_string()}, "
-                    f"shape={memory_obj.get_shape()}"
+                    f"shape={memory_obj.get_shape()}, "
+                    f"size={obj_size / 1e6:.3f} MBytes in {(end - begin) * 1000:.3f}ms"
                 )
             else:
                 self.stats["get_failure"] += 1
@@ -711,7 +724,7 @@ class SageMakerHyperPodConnector(RemoteConnector):
     async def batched_get(
         self, keys: List[CacheEngineKey]
     ) -> List[Optional[MemoryObj]]:
-        """Get multiple keys in parallel."""
+        """Get multiple keys in parallel. Metrics reported per individual get."""
         tasks = [self.get(key) for key in keys]
         return await asyncio.gather(*tasks)
 
@@ -722,7 +735,7 @@ class SageMakerHyperPodConnector(RemoteConnector):
     async def batched_put(
         self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
     ):
-        """Store multiple objects in parallel."""
+        """Store multiple objects in parallel. Metrics reported per individual put."""
         await asyncio.gather(
             *(self.put(key, mem) for key, mem in zip(keys, memory_objs, strict=True))
         )
@@ -740,6 +753,8 @@ class SageMakerHyperPodConnector(RemoteConnector):
         """Internal PUT operation - sends data via HTTP streaming."""
         key_str = self._key_to_string(key)
         url = f"{self.base_url}/v1/kv/{self.bucket_name}/{key_str}"
+
+        begin = time.perf_counter()
 
         try:
             # Build streaming payload (header + data)
@@ -760,14 +775,31 @@ class SageMakerHyperPodConnector(RemoteConnector):
                 gate=self.put_inflight,
             )
 
+            end = time.perf_counter()
+
             if result and result["status"] == HTTP_OK:
                 self.stats["put_success"] += 1
+
+                # Report metrics for successful put
+                self._stats_monitor.update_interval_remote_time_to_put(
+                    (end - begin) * 1000
+                )
+                self._stats_monitor.update_interval_remote_write_metrics(payload_len)
+
                 logger.info(
-                    f"PUT success: key={key_str}, size={payload_len / 1024:.2f} KB"
+                    f"PUT success: key={key_str}, size={payload_len / 1024:.2f} KB "
+                    f"in {(end - begin) * 1000:.3f}ms"
                 )
             elif result and result["status"] == HTTP_CONFLICT:
                 # 409 Conflict = key already exists (not an error)
                 self.stats["put_success"] += 1
+
+                # Still report metrics for conflict case
+                self._stats_monitor.update_interval_remote_time_to_put(
+                    (end - begin) * 1000
+                )
+                self._stats_monitor.update_interval_remote_write_metrics(payload_len)
+
                 logger.debug(f"PUT skipped (already exists): key={key_str}")
             else:
                 status = result["status"] if result else "TIMEOUT"
@@ -798,8 +830,8 @@ class SageMakerHyperPodConnector(RemoteConnector):
 
         metadata = RemoteMetadata(
             kv_len,
-            torch.Size(padded_shape),
-            memory_obj.get_dtype(),
+            [torch.Size(padded_shape)],
+            [memory_obj.get_dtype()],
             memory_obj.get_memory_format(),
         )
 

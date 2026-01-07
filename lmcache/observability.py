@@ -52,6 +52,8 @@ class LMCacheStats:
     interval_local_cpu_evict_keys_count: int  # evict keys count
     interval_local_cpu_evict_failed_count: int  # evict failed count
 
+    interval_forced_unpin_count: int  # forced unpin count due to timeout
+
     # Real time value measurements (will be reset after each log)
     retrieve_hit_rate: float
     lookup_hit_rate: float
@@ -80,6 +82,8 @@ class LMCacheStats:
     # use interval_lookup_0_hit_requests to represents 0 hit requests
     interval_lookup_hit_rates: List[float]
     interval_lookup_0_hit_requests: int
+
+    interval_request_cache_lifespan: List[float]  # cache lifespan in minutes
 
 
 @dataclass
@@ -193,6 +197,8 @@ class LMCStatsMonitor:
         self.interval_local_cpu_evict_keys_count = 0
         self.interval_local_cpu_evict_failed_count = 0
 
+        self.interval_forced_unpin_count = 0
+
         self.local_cache_usage_bytes = 0
         self.remote_cache_usage_bytes = 0
         self.local_storage_usage_bytes = 0
@@ -207,6 +213,9 @@ class LMCStatsMonitor:
         self.retrieve_request_id = 0
         self.store_request_id = 0
         self.lookup_request_id = 0
+
+        self.interval_request_cache_lifespan: Dict[int, float] = {}
+        self.reuse_chunk_id = 0
 
     @thread_safe
     def on_lookup_request(self, num_tokens: int) -> int:
@@ -313,6 +322,14 @@ class LMCStatsMonitor:
         p2p_stats.end_time = curr_time
 
     @thread_safe
+    def on_chunk_reuse(self, time_interval: float):
+        """
+        time_interval: float or int, in seconds
+        """
+        self.interval_request_cache_lifespan[self.reuse_chunk_id] = time_interval / 60.0
+        self.reuse_chunk_id += 1
+
+    @thread_safe
     def update_local_cache_usage(self, usage: int):
         self.local_cache_usage_bytes = usage
 
@@ -369,6 +386,10 @@ class LMCStatsMonitor:
         self.interval_local_cpu_evict_failed_count += evict_failed_count
 
     @thread_safe
+    def update_forced_unpin_count(self, delta: int):
+        self.interval_forced_unpin_count += delta
+
+    @thread_safe
     def update_active_memory_objs_count(self, active_memory_objs_count: int):
         self.active_memory_objs_count = active_memory_objs_count
 
@@ -418,6 +439,8 @@ class LMCStatsMonitor:
         self.interval_local_cpu_evict_keys_count = 0
         self.interval_local_cpu_evict_failed_count = 0
 
+        self.interval_forced_unpin_count = 0
+
         self.interval_p2p_requests = 0
         self.interval_p2p_transferred_tokens = 0
 
@@ -446,6 +469,9 @@ class LMCStatsMonitor:
             if not lookup_stats.is_finished:
                 new_lookup_requests[request_id] = lookup_stats
         self.lookup_requests = new_lookup_requests
+
+        self.interval_request_cache_lifespan.clear()
+        self.reuse_chunk_id = 0
 
     @thread_safe
     def get_stats_and_clear(self) -> LMCacheStats:
@@ -502,6 +528,8 @@ class LMCStatsMonitor:
             ]
         )
 
+        request_lifespan = list(self.interval_request_cache_lifespan.values())
+
         ret = LMCacheStats(
             interval_retrieve_requests=self.interval_retrieve_requests,
             interval_store_requests=self.interval_store_requests,
@@ -527,6 +555,7 @@ class LMCStatsMonitor:
             interval_local_cpu_evict_count=self.interval_local_cpu_evict_count,
             interval_local_cpu_evict_keys_count=self.interval_local_cpu_evict_keys_count,
             interval_local_cpu_evict_failed_count=self.interval_local_cpu_evict_failed_count,
+            interval_forced_unpin_count=self.interval_forced_unpin_count,
             local_cache_usage_bytes=self.local_cache_usage_bytes,
             remote_cache_usage_bytes=self.remote_cache_usage_bytes,
             local_storage_usage_bytes=self.local_storage_usage_bytes,
@@ -542,6 +571,7 @@ class LMCStatsMonitor:
             p2p_time_to_transfer=p2p_time_to_transfer,
             p2p_transfer_speed=p2p_transfer_speed,
             interval_lookup_hit_rates=request_lookup_hit_rates,
+            interval_request_cache_lifespan=request_lifespan,
             interval_prompt_tokens=self.interval_prompt_tokens,
             interval_lookup_0_hit_requests=self.interval_lookup_0_hit_requests,
         )
@@ -691,6 +721,12 @@ class PrometheusLogger:
         self.counter_local_cpu_evict_failed_count = self._counter_cls(
             name="lmcache:local_cpu_evict_failed_count",
             documentation="Total number of failed eviction in local cpu backend",
+            labelnames=labelnames,
+        )
+
+        self.counter_forced_unpin_count = self._counter_cls(
+            name="lmcache:forced_unpin_count",
+            documentation="Total number of forced unpin due to timeout",
             labelnames=labelnames,
         )
 
@@ -991,6 +1027,30 @@ class PrometheusLogger:
             buckets=request_cache_hit_rate,
         )
 
+        request_cache_lifespan_buckets = [
+            0,
+            1,
+            5,
+            10,
+            20,
+            40,
+            60,
+            80,
+            100,
+            250,
+            500,
+            750,
+            1000,
+            2500,
+            5000,
+        ]
+        self.histogram_request_cache_lifespan = self._histogram_cls(
+            name="lmcache:request_cache_lifespan",
+            documentation="Request cache lifespan in minutes",
+            labelnames=labelnames,
+            buckets=request_cache_lifespan_buckets,
+        )
+
         # Ping latency metrics: use a gauge to record the latest ping latency
         self.gauge_remote_ping_latency = self._gauge_cls(
             name="lmcache:remote_ping_latency",
@@ -1032,9 +1092,21 @@ class PrometheusLogger:
             labelnames=labelnames,
             multiprocess_mode="livemostrecent",
         ).labels(**self.labels)
+        self.kv_msg_queue_size = self._gauge_cls(
+            name="lmcache:kv_msg_queue_size",
+            documentation="The size of the KV message queue in BatchedMessageSender",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        ).labels(**self.labels)
         self.remote_put_task_num = self._gauge_cls(
             name="lmcache:remote_put_task_num",
             documentation="The number of remote put tasks",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        ).labels(**self.labels)
+        self.pin_monitor_pinned_objects_count = self._gauge_cls(
+            name="lmcache:pin_monitor_pinned_objects_count",
+            documentation="The number of pinned objects in PinMonitor",
             labelnames=labelnames,
             multiprocess_mode="livemostrecent",
         ).labels(**self.labels)
@@ -1047,6 +1119,82 @@ class PrometheusLogger:
                 documentation=f"The number of {status.replace('_', ' ')} events",
                 labelnames=labelnames,
                 multiprocess_mode="sum",
+            ).labels(**self.labels)
+            setattr(self, metric_name, gauge)
+
+        # Chunk statistics metrics (dynamic)
+        self.chunk_statistics_enabled = self._gauge_cls(
+            name="lmcache:chunk_statistics_enabled",
+            documentation="Whether chunk statistics collection is enabled",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        ).labels(**self.labels)
+        self.chunk_statistics_total_requests = self._gauge_cls(
+            name="lmcache:chunk_statistics_total_requests",
+            documentation="Total number of requests processed by chunk statistics",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        ).labels(**self.labels)
+        self.chunk_statistics_total_chunks = self._gauge_cls(
+            name="lmcache:chunk_statistics_total_chunks",
+            documentation="Total number of chunks processed",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        ).labels(**self.labels)
+        self.chunk_statistics_unique_chunks = self._gauge_cls(
+            name="lmcache:chunk_statistics_unique_chunks",
+            documentation="Number of unique chunks (estimated)",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        ).labels(**self.labels)
+        self.chunk_statistics_reuse_rate = self._gauge_cls(
+            name="lmcache:chunk_statistics_reuse_rate",
+            documentation="Chunk reuse rate (0.0 to 1.0)",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        ).labels(**self.labels)
+        self.chunk_statistics_bloom_filter_size_mb = self._gauge_cls(
+            name="lmcache:chunk_statistics_bloom_filter_size_mb",
+            documentation="Bloom Filter memory usage in MB",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        ).labels(**self.labels)
+        self.chunk_statistics_bloom_filter_fill_rate = self._gauge_cls(
+            name="lmcache:chunk_statistics_bloom_filter_fill_rate",
+            documentation="Bloom Filter fill rate (0.0 to 1.0)",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        ).labels(**self.labels)
+        self.chunk_statistics_file_count = self._gauge_cls(
+            name="lmcache:chunk_statistics_file_count",
+            documentation="Number of files created for file_hash strategy",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        ).labels(**self.labels)
+        self.chunk_statistics_current_file_size = self._gauge_cls(
+            name="lmcache:chunk_statistics_current_file_size",
+            documentation="Current file size in bytes for file_hash strategy",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        ).labels(**self.labels)
+
+        # Connector metrics
+        connector_metrics = [
+            "scheduler_unfinished_requests_count",
+            "connector_load_specs_count",
+            "connector_request_trackers_count",
+            "connector_kv_caches_count",
+            "connector_layerwise_retrievers_count",
+            "connector_invalid_block_ids_count",
+            "connector_requests_priority_count",
+        ]
+
+        for metric_name in connector_metrics:
+            gauge = self._gauge_cls(
+                name=f"lmcache:{metric_name}",
+                documentation=f"The count of {metric_name.replace('_', ' ')}",
+                labelnames=labelnames,
+                multiprocess_mode="livemostrecent",
             ).labels(**self.labels)
             setattr(self, metric_name, gauge)
 
@@ -1117,6 +1265,10 @@ class PrometheusLogger:
             stats.interval_local_cpu_evict_failed_count,
         )
         self._log_counter(
+            self.counter_forced_unpin_count,
+            stats.interval_forced_unpin_count,
+        )
+        self._log_counter(
             self.counter_lookup_0_hit_requests,
             stats.interval_lookup_0_hit_requests,
         )
@@ -1158,6 +1310,9 @@ class PrometheusLogger:
         self._log_histogram(
             self.histogram_request_cache_hit_rate, stats.interval_lookup_hit_rates
         )
+        self._log_histogram(
+            self.histogram_request_cache_lifespan, stats.interval_request_cache_lifespan
+        )
         self._log_gauge(
             self.gauge_remote_ping_latency, stats.interval_remote_ping_latency
         )
@@ -1179,10 +1334,14 @@ class PrometheusLogger:
 
     @staticmethod
     def _metadata_to_labels(metadata: LMCacheEngineMetadata):
-        return {
+        labels = {
             "model_name": metadata.model_name,
             "worker_id": metadata.worker_id,
+            "role": metadata.role,
         }
+        if metadata.served_model_name:
+            labels["served_model_name"] = metadata.served_model_name
+        return labels
 
     _instance = None
 
@@ -1224,6 +1383,8 @@ class LMCacheStatsLogger:
         self.prometheus_logger = PrometheusLogger.GetOrCreate(metadata)
         self.lmc_usage_logger = ContinuousUsageContext.GetOrCreate(metadata)
         self.is_running = True
+        # Event for interruptible sleep during shutdown
+        self.shutdown_event = threading.Event()
 
         self.thread = threading.Thread(target=self.log_worker, daemon=True)
         self.thread.start()
@@ -1233,8 +1394,44 @@ class LMCacheStatsLogger:
             stats = self.monitor.get_stats_and_clear()
             self.prometheus_logger.log_prometheus(stats)
             self.lmc_usage_logger.incr_or_send_stats(stats)
-            time.sleep(self.log_interval)
+            # Use Event.wait() instead of time.sleep() for interruptible sleep
+            # Returns True if event was set, False if timeout occurred
+            self.shutdown_event.wait(self.log_interval)
 
     def shutdown(self):
+        """Shutdown the stats logger gracefully with immediate wake-up"""
+        logger.info("Shutting down LMCacheStatsLogger...")
+
+        # Signal the worker thread to stop
         self.is_running = False
-        self.thread.join()
+
+        # Signal the event to wake up the thread immediately from sleep
+        self.shutdown_event.set()
+
+        # Wait for thread with a reasonable timeout
+        if self.thread.is_alive():
+            # Since we wake up the thread immediately, use a shorter timeout
+            # Just enough time for the thread to finish its current iteration
+            timeout = 5.0
+            logger.info(
+                f"Waiting for stats logger thread to finish (timeout: {timeout}s)..."
+            )
+
+            try:
+                self.thread.join(timeout=timeout)
+
+                if self.thread.is_alive():
+                    logger.warning(
+                        f"Stats logger thread did not terminate "
+                        f"within {timeout}s timeout. "
+                        "Thread may be blocked in logging operations. "
+                        "Proceeding with shutdown anyway."
+                    )
+                else:
+                    logger.info("Stats logger thread terminated successfully")
+            except Exception as e:
+                logger.error(f"Error waiting for stats logger thread: {e}")
+        else:
+            logger.info("Stats logger thread already stopped")
+
+        logger.info("LMCacheStatsLogger shutdown complete")
